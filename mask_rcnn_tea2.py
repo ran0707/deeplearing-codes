@@ -11,7 +11,7 @@ from torchvision.transforms import functional as F
 from sklearn.metrics import confusion_matrix, classification_report
 import shutil
 import random
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 # ==============================
 # 1. Setup and Configuration
@@ -38,12 +38,17 @@ except NameError:
 # Define class-to-index mapping based on your dataset
 class_to_idx = {
     'background': 0,    # Always include background as class 0
-    'early tmb': 1,
-    'late tmb': 2,
-    'looper': 3
+    'rsc': 1,
+    'looper': 2,
+    'rsm': 3,
+    'thrips': 4,
+    'jassid': 5,
+    'tmb': 6, 
+    'healthy': 7
 }
 num_classes = len(class_to_idx)
 idx_to_class = {v: k for k, v in class_to_idx.items()}
+
 # ==============================
 # 2. Custom Dataset Class
 # ==============================
@@ -61,8 +66,13 @@ class CustomDataset(Dataset):
         self.annotations = {}
         for key, value in annotations.items():
             filename = value['filename']
-            self.imgs.append(filename)
-            self.annotations[filename] = value
+            regions = value.get('regions', {})
+            # Ensure that regions is a list
+            if isinstance(regions, dict):
+                regions = [regions[k] for k in regions]
+            if len(regions) > 0:
+                self.imgs.append(filename)
+                self.annotations[filename] = value
 
         self.imgs = sorted(list(set(self.imgs)))
 
@@ -110,8 +120,12 @@ class CustomDataset(Dataset):
 
                     masks.append(mask)
 
+                    # Validate box coordinates
                     x_min, x_max = min(all_points_x), max(all_points_x)
                     y_min, y_max = min(all_points_y), max(all_points_y)
+                    if x_max <= x_min or y_max <= y_min:
+                        print(f"Invalid box coordinates for image {img_filename}: {[x_min, y_min, x_max, y_max]}")
+                        continue
                     boxes.append([x_min, y_min, x_max, y_max])
 
                 elif shape_attrs.get('name') == 'rect':
@@ -121,6 +135,12 @@ class CustomDataset(Dataset):
                     height = shape_attrs.get('height', 0)
                     x_min, y_min = x, y
                     x_max, y_max = x + width, y + height
+
+                    # Validate box coordinates
+                    if x_max <= x_min or y_max <= y_min:
+                        print(f"Invalid rectangle for image {img_filename}: {shape_attrs}")
+                        continue
+
                     boxes.append([x_min, y_min, x_max, y_max])
                     masks.append(self.create_rect_mask(x_min, y_min, x_max, y_max, img_width, img_height))
 
@@ -128,6 +148,10 @@ class CustomDataset(Dataset):
             boxes = torch.as_tensor(boxes, dtype=torch.float32)
             labels = torch.as_tensor(labels, dtype=torch.int64)
             masks = torch.as_tensor(np.stack(masks), dtype=torch.uint8)
+
+            # Ensure that masks have the correct shape
+            if masks.dim() != 3:
+                masks = masks.unsqueeze(0)
         else:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,), dtype=torch.int64)
@@ -164,8 +188,9 @@ def collate_fn(batch):
 # 4. Data Preparation
 # ==============================
 
-image_dir = '/home/idrone2/Desktop/ANNOTATED_LEAF'            # Adjust the path to your images folder
-annotation_file = '/home/idrone2/Desktop/labels_tea-pest_2024-10-21-02-31-24.json'  # Adjust the path to your annotations file
+# Update these paths to your actual data locations
+image_dir = '/home/idrone2/Desktop/new'             # Path to your images folder
+annotation_file = '/home/idrone2/Desktop/tea_pest.json'  # Path to your annotations file
 
 dataset = CustomDataset(image_dir=image_dir, annotation_file=annotation_file)
 
@@ -186,38 +211,68 @@ data_loader_test = DataLoader(test_dataset, batch_size=1, shuffle=False, num_wor
 # 5. Model Initialization
 # ==============================
 
-model = maskrcnn_resnet50_fpn(pretrained=True)
+# Addressing the deprecation warning by using 'weights' instead of 'pretrained'
+from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
 
+# Choose the appropriate weights, e.g., COCO_V1 or DEFAULT
+weights = MaskRCNN_ResNet50_FPN_Weights.COCO_V1
+model = maskrcnn_resnet50_fpn(weights=weights)
+
+# Replace the box predictor with a new one for our custom classes
 in_features = model.roi_heads.box_predictor.cls_score.in_features
 model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes)
+
+# Replace the mask predictor as well if you're training masks
+in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+hidden_layer = 256
+model.roi_heads.mask_predictor = torchvision.models.detection.mask_rcnn.MaskRCNNPredictor(
+    in_channels=in_features_mask,
+    dim_reduced=hidden_layer,
+    num_classes=num_classes
+)
 
 # ==============================
 # 6. Training and Validation Functions
 # ==============================
 
-
-def train_one_epoch(model, optimizer, data_loader, device, epoch, train_losses, print_freq=10):
+def train_one_epoch(model, optimizer, data_loader, device, epoch, train_losses, print_freq=10, max_grad_norm=10):
     model.train()
     running_loss = 0.0
     for i, (images, targets) in enumerate(data_loader):
         images = list(image.to(device) for image in images)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
+        # Check for empty targets and skip if necessary
+        if any([len(t["boxes"]) == 0 for t in targets]):
+            print(f"Skipping batch {i} in epoch {epoch} due to empty targets.")
+            continue
+
         loss_dict = model(images, targets)
         losses = sum(loss for loss in loss_dict.values())
 
+        # Check for NaN losses
+        if torch.isnan(losses):
+            print(f"NaN loss encountered at epoch {epoch}, iteration {i}. Skipping update.")
+            continue
+
         optimizer.zero_grad()
         losses.backward()
+
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
         optimizer.step()
 
         running_loss += losses.item()
         if i % print_freq == 0:
             print(f"Epoch [{epoch}], Iteration [{i}/{len(data_loader)}], Loss: {losses.item():.4f}")
 
-    train_losses.append(running_loss / len(data_loader))
+    epoch_loss = running_loss / len(data_loader)
+    train_losses.append(epoch_loss)
+    print(f"Epoch [{epoch}] Training Loss: {epoch_loss:.4f}")
 
 def validate_one_epoch(model, data_loader, device, val_losses):
-    model.train()  # Keep the model in train mode for loss calculation
+    model.train()  # Set model to training mode to compute losses
     running_val_loss = 0.0
 
     with torch.no_grad():
@@ -225,12 +280,29 @@ def validate_one_epoch(model, data_loader, device, val_losses):
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
+            # Check for empty targets and skip if necessary
+            if any([len(t["boxes"]) == 0 for t in targets]):
+                print("Empty target found during validation. Skipping this batch.")
+                continue
+
             # Calculate validation loss
             loss_dict = model(images, targets)
             losses = sum(loss for loss in loss_dict.values())
+
+            # Check for NaN losses
+            if torch.isnan(losses):
+                print("NaN loss encountered during validation. Skipping this batch.")
+                continue
+
             running_val_loss += losses.item()
 
-    val_losses.append(running_val_loss / len(data_loader))
+    if len(data_loader) > 0:
+        epoch_val_loss = running_val_loss / len(data_loader)
+        val_losses.append(epoch_val_loss)
+        print(f"Validation Loss: {epoch_val_loss:.4f}")
+    else:
+        print("No data in validation loader.")
+        val_losses.append(None)
 
 # ==============================
 # 7. Training Loop
@@ -244,59 +316,96 @@ train_losses = []
 val_losses = []
 
 params = [p for p in model.parameters() if p.requires_grad]
-optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+optimizer = torch.optim.SGD(params, lr=0.001, momentum=0.9, weight_decay=0.0005)  # Reduced learning rate
 
 for epoch in range(num_epochs):
     print(f"Starting epoch {epoch + 1} / {num_epochs}")
 
     # Training
-    train_one_epoch(model, optimizer, data_loader, device, epoch, train_losses)
+    train_one_epoch(model, optimizer, data_loader, device, epoch + 1, train_losses)
 
     # Validation (Calculate validation loss without updating weights)
-    validate_one_epoch(model, data_loader_test, device, val_losses)
+    try:
+        validate_one_epoch(model, data_loader_test, device, val_losses)
+    except RuntimeError as e:
+        print(f"RuntimeError during validation: {e}")
+        break  # Exit training loop if validation fails
 
-    # Save model after every epoch
-    torch.save(model.state_dict(), os.path.join(output_dir, f"maskrcnn_epoch_{epoch+1}.pth"))
+# Save the model after all epochs are completed
+torch.save(model.state_dict(), os.path.join(output_dir, "maskrcnn_final.pth"))
+print(f"Model saved to {os.path.join(output_dir, 'maskrcnn_final.pth')}")
 
 # ==============================
 # 8. Save Loss Graphs
 # ==============================
 
-# Plot both training and validation loss
-plt.figure(figsize=(10, 5))
+# Adjust the plotting to handle cases where validation fails early
+epochs_range = range(1, len(train_losses) + 1)
 
 # Plot Training Loss
+plt.figure(figsize=(12, 6))
 plt.subplot(1, 2, 1)
-plt.plot(range(1, num_epochs+1), train_losses, label='Training Loss', color='blue')
+plt.plot(epochs_range, train_losses, label='Training Loss', color='blue')
 plt.xlabel('Epochs')
 plt.ylabel('Loss')
 plt.title('Training Loss Over Epochs')
 plt.legend()
 
-# Plot Validation Loss
-plt.subplot(1, 2, 2)
-plt.plot(range(1, num_epochs+1), val_losses, label='Validation Loss', color='orange')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.title('Validation Loss Over Epochs')
-plt.legend()
+# Plot Validation Loss only if available
+if val_losses and any(v is not None for v in val_losses):
+    valid_epochs = [i for i, v in enumerate(val_losses, 1) if v is not None]
+    valid_losses = [v for v in val_losses if v is not None]
+    plt.subplot(1, 2, 2)
+    plt.plot(valid_epochs, valid_losses, label='Validation Loss', color='orange')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Validation Loss Over Epochs')
+    plt.legend()
+else:
+    print("No valid validation losses to plot.")
 
-plt.savefig(os.path.join(output_dir, "validation_loss.png"))
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "loss_graphs.png"))
+plt.close()
+print(f"Loss graphs saved to {os.path.join(output_dir, 'loss_graphs.png')}")
 
 # ==============================
 # 9. Prediction and Visualization
 # ==============================
 
-def save_predictions_as_images(model, data_loader, device, idx_to_class, semantic_segmentation=False):
+def save_predictions_as_images(model, data_loader, device, idx_to_class, confidence_threshold=0.2, semantic_segmentation=False):
     model.eval()
+    font = None
+    try:
+        font = ImageFont.truetype("/home/idrone2/linux-fonts/arial.ttf", 26)  # Increased font size to 26px
+    except IOError:
+        print("Arial font not found. Using default font.")
+        font = ImageFont.load_default()
+
     with torch.no_grad():
-        for idx, (images, _) in enumerate(data_loader):
+        for idx, (images, img_filename) in enumerate(data_loader):
             images = list(img.to(device) for img in images)
             outputs = model(images)
 
-            if len(outputs) == 0 or len(outputs[0]['boxes']) == 0:
+            if not isinstance(outputs, list) or len(outputs) == 0:
                 print(f"No predictions found for image {idx+1}. Skipping.")
                 continue
+
+            # Handle outputs based on whether targets were provided during inference
+            # Since targets are not provided during inference, outputs are predictions
+            output = outputs[0]
+
+            # Apply confidence threshold
+            scores = output['scores'].cpu().numpy()
+            high_conf_indices = np.where(scores >= confidence_threshold)[0]
+            if len(high_conf_indices) == 0:
+                print(f"No predictions above confidence threshold for image {idx+1}. Skipping.")
+                continue
+
+            # Filter predictions based on confidence
+            boxes = output['boxes'][high_conf_indices].cpu().numpy()
+            labels = output['labels'][high_conf_indices].cpu().numpy()
+            masks = output['masks'][high_conf_indices].cpu().numpy()  # (N, 1, H, W)
 
             # Convert the first image to PIL for visualization
             image = images[0].cpu().mul(255).permute(1, 2, 0).byte().numpy()
@@ -304,11 +413,6 @@ def save_predictions_as_images(model, data_loader, device, idx_to_class, semanti
 
             # Create drawing interface for the image
             draw = ImageDraw.Draw(image_pil)
-
-            # Get output masks and labels
-            boxes = outputs[0]['boxes'].cpu().numpy()
-            labels = outputs[0]['labels'].cpu().numpy()
-            masks = outputs[0]['masks'].cpu().numpy()  # (N, 1, H, W)
 
             # Threshold masks to create binary masks
             masks = masks > 0.5
@@ -318,10 +422,11 @@ def save_predictions_as_images(model, data_loader, device, idx_to_class, semanti
                 label = labels[i]
                 class_name = idx_to_class.get(label, "Unknown")
 
-                # Draw the bounding box with thicker lines
-                draw.rectangle(box.tolist(), outline="red", width=5)  # Thicker lines
-                font = ImageFont.truetype("arial.ttf", 24)  # Larger font
-                draw.text((box[0], box[1]), f"{class_name}", fill="red", font=font)  # Larger labels
+                # Draw the bounding box with increased width
+                draw.rectangle(box.tolist(), outline="red", width=4)  # Increased bbox width to 2px
+
+                # Draw the label with increased font size
+                draw.text((box[0], box[1]), f"{class_name}", fill="red", font=font)
 
                 # Apply mask (instance segmentation) with transparency
                 mask = masks[i, 0]
@@ -329,10 +434,12 @@ def save_predictions_as_images(model, data_loader, device, idx_to_class, semanti
                 mask_image.putalpha(128)  # Set transparency
 
                 # Paste the mask on the image with transparency
-                image_pil.paste(mask_image, mask=mask_image)
+                image_pil = Image.alpha_composite(image_pil.convert("RGBA"), mask_image)
 
             # Save the instance segmentation result
+            image_pil = image_pil.convert("RGB")  # Convert back to RGB before saving
             image_pil.save(os.path.join(predicted_images_dir, f"instance_segmentation_{idx+1}.png"))
+            print(f"Saved instance_segmentation_{idx+1}.png")
 
             if semantic_segmentation:
                 # For semantic segmentation, accumulate masks by class
@@ -344,4 +451,65 @@ def save_predictions_as_images(model, data_loader, device, idx_to_class, semanti
                 # Create an image from the semantic mask
                 semantic_image = Image.fromarray(semantic_mask).convert("RGB")
                 semantic_image.save(os.path.join(predicted_images_dir, f"semantic_segmentation_{idx+1}.png"))
+                print(f"Saved semantic_segmentation_{idx+1}.png")
+
+# ==============================
+# 10. Inference (Prediction) Loop
+# ==============================
+
+# Since during inference we don't provide targets, create a DataLoader without targets
+# Modify the DataLoader to return only images for inference
+class InferenceDataset(Dataset):
+    def __init__(self, image_dir, annotation_file=None, transforms=None):
+        self.image_dir = image_dir
+        self.transforms = transforms
+
+        # Load annotations from JSON file if provided
+        if annotation_file:
+            with open(annotation_file, 'r') as f:
+                annotations = json.load(f)
+
+            self.imgs = []
+            for key, value in annotations.items():
+                filename = value['filename']
+                regions = value.get('regions', {})
+                if isinstance(regions, dict):
+                    regions = [regions[k] for k in regions]
+                if len(regions) > 0:
+                    self.imgs.append(filename)
+        else:
+            # Include all images if no annotation file is provided
+            self.imgs = sorted([f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))])
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, idx):
+        img_filename = self.imgs[idx]
+        img_path = os.path.join(self.image_dir, img_filename)
+
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
+            img = Image.new('RGB', (224, 224), (0, 0, 0))  # Black image
+
+        img = F.to_tensor(img)
+
+        if self.transforms:
+            img = self.transforms(img)
+
+        return img, img_filename  # Return filename for saving
+
+# Create an inference dataset and dataloader
+inference_dataset = InferenceDataset(image_dir=image_dir, transforms=None)
+data_loader_inference = DataLoader(inference_dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn)
+
+# ==============================
+# 11. Save Predictions After Training
+# ==============================
+
+# Call the prediction function after training
+save_predictions_as_images(model, data_loader_inference, device, idx_to_class, confidence_threshold=0.7, semantic_segmentation=False)
+print(f"Predicted images saved to {predicted_images_dir}")
 
